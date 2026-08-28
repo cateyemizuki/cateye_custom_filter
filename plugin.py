@@ -22,7 +22,8 @@
   放进插件数据文件夹（data/plugins/github.cateye.custom-filter/archive/）：
   - 填写了有效的 archive_file_name → 用该名称归档；
   - 未填或填入内容无效 → 用时间戳兜底命名（filter_YYYYmmdd_HHMMSS.json）；
-  - 归档完成后配置重置（黑名单/时间/类型开关恢复默认）；
+- 插件只负责归档，**不写回/不重置 config.toml**（config.toml 由 Runner 生成与维护，
+  插件不自行落盘，避免与 WebUI 保存、热重载竞争）；需要恢复默认时请在 WebUI 手动清空；
 - 即使已经配置好的文件没有使用开关进行归档（即还可以在 WebUI 中修改），也生效。
 """
 
@@ -167,7 +168,7 @@ class PluginSectionConfig(PluginConfigBase):
     )
     archive_enabled: bool = Field(
         default=False,
-        description="归档开关：开启（设为 true）并保存修改后，自动把当前过滤配置转成 json 放进插件数据文件夹，随后配置重置。未归档的配置同样生效",
+        description="归档开关：开启（设为 true）并保存修改后，自动把当前过滤配置转成 json 放进插件数据文件夹（只归档，不自动重置；恢复默认请在 WebUI 手动清空）。未归档的配置同样生效",
     )
 
 
@@ -186,10 +187,6 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
 
     config_model: ClassVar[type[PluginConfigBase] | None] = CateyeCustomFilterConfig
     config_reload_subscriptions: ClassVar[Iterable[str]] = ()
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._config_toml_path: Optional[str] = None  # 测试可覆盖 config.toml 路径
 
     # ==================== 配置读取 ====================
 
@@ -370,7 +367,7 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             return
         self._check_config_version()
         self._validate_schedule_config()
-        # 归档开关：开启（true）并保存修改 → 归档当前配置后重置
+        # 归档开关：开启（true）并保存修改 → 归档当前配置（只归档，不自动重置）
         try:
             archive_enabled = bool(self.config.plugin.archive_enabled)
         except Exception:
@@ -379,11 +376,15 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             requested = str(self.config.plugin.archive_file_name or "").strip()
             path = self._archive_current_config(requested)
             if path:
-                # 归档成功 → 重置过滤配置（写回 config.toml，Runner 热重载后复位）
-                self._reset_filter_config()
-                msg = f"过滤配置已归档：{path}\n当前过滤配置已重置为默认。"
+                # 只归档、不自动重置：config.toml 由 Runner 生成与维护，插件不自行写回，
+                # 避免与 WebUI 保存、热重载竞争（插件中心评审建议）。
+                # 需要恢复默认时请在 WebUI 手动清空黑名单/恢复时间与类型开关。
+                msg = (
+                    f"过滤配置已归档：{path}\n"
+                    "如需恢复默认过滤规则，请在 WebUI 手动清空黑名单、恢复默认时间窗口与类型开关。"
+                )
             else:
-                msg = "归档失败（见日志），过滤配置未重置。"
+                msg = "归档失败（见日志）。"
             self.ctx.logger.info("归档流程：%s", msg)
         else:
             self.ctx.logger.info("麦麦不要再看那个了！配置已更新（未触发归档）")
@@ -402,58 +403,6 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
                 self.ctx.logger.debug("当前处于过滤时间窗口内")
         except Exception:
             pass
-
-    def _get_config_toml_path(self) -> str:
-        """config.toml 路径（测试可覆盖）。"""
-        if self._config_toml_path:
-            return self._config_toml_path
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
-
-    def _reset_filter_config(self) -> None:
-        """归档完成后把过滤配置重置为默认（写回 config.toml 并由 Runner 热重载）。
-
-        重置内容：群/用户黑名单清空、过滤时间恢复默认（全天/每天）、
-        类型开关恢复默认（戳一戳/表情包/文字开，合并转发/图片关）。
-        """
-        config_path = self._get_config_toml_path()
-        try:
-            import tomlkit
-
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    doc = tomlkit.parse(f.read())
-            else:
-                doc = tomlkit.document()
-
-            def _reset_section(doc: Any, section: str, values: Mapping[str, Any]) -> None:
-                table = doc.setdefault(section, tomlkit.table())
-                for key, val in values.items():
-                    table[key] = val
-
-            _reset_section(doc, "blacklist", {
-                "group_blacklist": [],
-                "user_blacklist": [],
-            })
-            _reset_section(doc, "schedule", {
-                "filter_periods": list(DEFAULT_FILTER_PERIODS),
-                "filter_weekdays": list(DEFAULT_FILTER_WEEKDAYS),
-            })
-            _reset_section(doc, "types", {
-                "allow_poke": DEFAULT_ALLOW_POKE,
-                "allow_emoji": DEFAULT_ALLOW_EMOJI,
-                "allow_forward": DEFAULT_ALLOW_FORWARD,
-                "allow_image": DEFAULT_ALLOW_IMAGE,
-                "allow_text": DEFAULT_ALLOW_TEXT,
-            })
-            # 归档控制字段复位：归档开关回 false，文件名清空
-            plugin_table = doc.setdefault("plugin", tomlkit.table())
-            plugin_table["archive_enabled"] = False
-            plugin_table["archive_file_name"] = ""
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(tomlkit.dumps(doc))
-            self.ctx.logger.info("已重置过滤配置并写回 config.toml（Runner 将热重载）")
-        except Exception as e:
-            self.ctx.logger.warning("重置过滤配置失败（可在 WebUI 手动重置）：%s", e)
 
 
 def _extract_ids(message: Mapping[str, Any]) -> tuple[str, str]:
