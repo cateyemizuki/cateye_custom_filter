@@ -42,7 +42,7 @@
 enabled = true                 # 是否启用插件（关闭后不拦截任何消息）
 config_version = "1.0.0"       # 配置版本（与插件版本同步，UI 中隐藏）
 archive_file_name = ""         # 保存的 json 文件名称（仅支持英文，如 my_rule；可省略 .json。留空 = 时间戳命名）
-archive_enabled = false        # 归档开关：开启（true）并保存修改后，自动把当前过滤配置转成 json，随后配置重置
+archive_enabled = false        # 归档开关：开启（true）并保存修改后，自动把当前过滤配置转成 json（只归档，不自动重置）
 
 [blacklist]                    # 群/用户黑名单（仅黑名单，用于过滤信息）
 group_blacklist = []           # 群黑名单（填群号；留空 = 不按群过滤）
@@ -67,7 +67,7 @@ allow_text = true              # 文字信息（默认开）
 | `plugin.enabled` | 是否启用插件（默认开）。关闭后不拦截任何消息 |
 | `plugin.config_version` | 配置版本（与插件版本同步，UI 中隐藏） |
 | `plugin.archive_file_name` | 归档 JSON 文件名称，**仅支持英文**（如 `my_rule`，可省略 `.json`；默认空） |
-| `plugin.archive_enabled` | 归档开关（默认关）。**开启（设为 true）并保存修改后**：自动把当前过滤配置转成 JSON 放进插件数据文件夹 → 随后配置重置 |
+| `plugin.archive_enabled` | 归档开关（默认关）。**开启（设为 true）并保存修改后**：自动把当前过滤配置转成 JSON 放进插件数据文件夹（只归档，不自动重置；恢复默认请在 WebUI 手动清空） |
 | `blacklist.group_blacklist` | 群黑名单（群号）。留空 = 不按群过滤 |
 | `blacklist.user_blacklist` | 用户黑名单（用户ID 或 `平台:用户ID`）。可填 `all`（大小写不敏感，也支持 `qq:all`）表示群黑名单中所配置的群的群内所有成员（需配合群黑名单使用）。留空 = 不按用户过滤 |
 | `schedule.filter_periods` | 每日要过滤的时间段列表，`HH:MM-HH:MM`（半开区间 `[start, end)`），支持跨天；留空 = 全天 |
@@ -105,7 +105,7 @@ allow_text = true              # 文字信息（默认开）
 - **归档开关**：在 WebUI 把 `plugin.archive_enabled` 设为 `true` 并保存修改（即设为 true 并保存后），插件自动执行：
   1. 把**当前过滤配置**（群/用户黑名单 + 过滤时间 + 类型开关）转为 JSON 写入插件数据文件夹：`data/plugins/github.cateye.custom-filter/archive/`；
   2. 文件名优先使用 `plugin.archive_file_name`（仅支持英文，如 `my_rule` → `my_rule.json`）；**未填或填入的内容无效**（非英文、含非法字符、含路径等）→ **使用时间戳兜底命名**（如 `filter_20260827_233000.json`）；
-  3. 归档完成后**配置重置**（黑名单清空、过滤时间恢复全天/每天、类型开关恢复默认；归档开关复位为关、文件名清空）。
+  3. 插件**只负责归档、不自动重置配置**（config.toml 由 Runner 生成与维护，插件不自行写回，避免与 WebUI 保存、热重载竞争）。需要恢复默认过滤规则时，请在 **WebUI 手动清空黑名单、恢复默认时间窗口与类型开关**。
 - **已配置但未归档的规则同样生效**：即使不点归档开关，WebUI 里配置好的过滤规则也会实时生效（不需要先归档）。
 - **多版规则**：归档得到多个 JSON 后，需要哪版就把哪版内容手动填回 WebUI（或作为参考备份），即可切换规则版本。
 
@@ -136,7 +136,7 @@ allow_text = true              # 文字信息（默认开）
   文字：开（放行）
 [INFO] 已拦截消息（群=123456789 用户=987654321 类型=emoji,text）
 [INFO] 过滤配置已归档：D:\MaiBot\data\plugins\github.cateye.custom-filter\archive\my_rule.json
-[INFO] 归档流程：过滤配置已归档：...\n当前过滤配置已重置为默认。
+[INFO] 归档流程：过滤配置已归档：...\n如需恢复默认过滤规则，请在 WebUI 手动清空黑名单、恢复默认时间窗口与类型开关。
 ```
 
 ## 常见问题
@@ -144,7 +144,7 @@ allow_text = true              # 文字信息（默认开）
 - **为什么消息没被拦截？** 检查：① `plugin.enabled` 开启；② 群/用户黑名单已填且 ID 正确（群号、用户ID 或 `平台:用户ID`）；③ 使用 `all`（群内所有成员）时须同时填写群黑名单；④ 当前时间在过滤时间窗口内（`filter_periods`/`filter_weekdays`）；⑤ 消息包含的类型开关为「关闭」（如图片默认关、文字默认开）；⑥ 消息类型可被识别。
 - **不想拦截了怎么办？** WebUI 关闭 `plugin.enabled`，或清空黑名单/过滤时间。
 - **归档文件名没生效？** `archive_file_name` 仅支持英文（字母/数字/点/下划线/短横线，不能含路径），无效时自动用时间戳命名。
-- **归档后配置被重置了？** 这是归档的预期行为（保存并重置），重置前规则已导出为 JSON，需要时可照 JSON 填回。
+- **归档后想恢复默认规则？** 插件只归档、不自动重置（config.toml 由 Runner 维护，插件不自行写回）。请在 **WebUI 手动清空黑名单、恢复默认时间窗口与类型开关**；已归档的 JSON 可作参考备份，需要时照 JSON 填回。
 
 ## 版本历史
 
