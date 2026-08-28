@@ -61,7 +61,7 @@ from .filter_core import (
 
 # 配置版本：与 _manifest.json 的 version 保持同步。
 # 1.0.0：初始版本。
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+SUPPORTED_CONFIG_VERSION = "1.0.1"
 
 # 默认过滤时间：全天（periods 空） + 每天（weekdays 空）
 DEFAULT_FILTER_PERIODS: List[str] = []
