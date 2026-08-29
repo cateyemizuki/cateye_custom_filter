@@ -11,7 +11,8 @@
 - 时段格式 "HH:MM-HH:MM"，支持跨天（如 "22:00-02:00"），开始时间 ≤ 结束时间视为同一自然日；
 - 星期：1=周一 ... 7=周日；filter_weekdays 为空 = 每天；
 - filter_periods 为空 = 全天；
-- 黑名单任一为空 = 不限制该维度；群/用户黑名单命中为「或」关系；
+- 黑名单为交集过滤：配置了哪些维度就必须同时命中哪些维度（如同时配置群+用户，
+  则只有该群内该用户的消息才被过滤）；某维度留空 = 不限制该维度；
 - 消息分类为并集：消息只要包含任一被关闭（拦截）的类型，即被整体拦截；
   只有包含的所有类型均为开启（放行）时才入库入站；未识别的消息类型（语音/视频/文件/其它通知等）一律放行。
 """
@@ -179,28 +180,35 @@ def is_targeted(
     group_blacklist: Sequence[Any],
     user_blacklist: Sequence[Any],
 ) -> bool:
-    """是否命中黑名单（仅黑名单）。
+    """是否命中黑名单（仅黑名单，交集语义）。
 
-    - group_blacklist 为空 = 不按群过滤；非空 = 群号在其中即命中（整群过滤）；
-    - user_blacklist 为空 = 不按用户过滤；非空 = 用户 ID 在其中即命中；
-      特殊值 ``all``（大小写不敏感，也支持 ``平台:all``）= 群黑名单中所配置的
-      群的群内所有成员：仅当消息来自群黑名单中的群时命中（需要 group_blacklist
-      非空才生效，不匹配私聊）；
-    - 群/用户为「或」关系：任一命中即视为被指定的过滤对象。
+    交集过滤：配置了哪些维度，就必须同时命中哪些维度，全部满足才视为过滤对象：
+
+    - 仅配置群黑名单：消息群号命中即过滤（整群过滤）；
+    - 仅配置用户黑名单：消息用户 ID 命中即过滤（含私聊；``all`` 标记在无群
+      黑名单时不生效）；
+    - 同时配置群 + 用户黑名单：消息必须**既**来自黑名单群、**又**来自黑名单
+      用户（交集）才过滤；用户黑名单中的特殊值 ``all``（大小写不敏感，也支持
+      ``平台:all``）表示该黑名单群内的所有成员（此时等价于整群过滤）；
+    - 两者均为空：不过滤任何消息。
     """
+    group_hit: Optional[bool] = None
     if group_blacklist:
-        if any(id_matches(group_id, g) for g in group_blacklist):
-            return True
+        group_hit = bool(group_id) and any(id_matches(group_id, g) for g in group_blacklist)
+    user_hit: Optional[bool] = None
     if user_blacklist:
-        entries = [u for u in (user_blacklist or ())]
-        # 特殊值 all：群黑名单中所配置的群 → 群内所有成员
+        entries = [u for u in user_blacklist]
+        # 特殊值 all：群黑名单中所配置的群 → 群内所有成员（需群维度命中）
         if any(is_all_marker(u) for u in entries):
-            if group_id and group_blacklist and any(id_matches(group_id, g) for g in group_blacklist):
-                return True
-        # 常规用户 ID 匹配（跳过 all 标记）
-        if any(id_matches(user_id, u) for u in entries if not is_all_marker(u)):
-            return True
-    return False
+            user_hit = bool(group_hit) if group_hit is not None else False
+        else:
+            user_hit = bool(user_id) and any(
+                id_matches(user_id, u) for u in entries if not is_all_marker(u)
+            )
+    if group_hit is None and user_hit is None:
+        return False
+    # 交集：所有已配置维度都必须命中
+    return (group_hit is not False) and (user_hit is not False)
 
 
 # -------------------- 消息分类 --------------------
@@ -297,7 +305,7 @@ def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any
         }
 
     判定流程：
-    1. 群/用户黑名单命中（任一命中即指定对象）；
+    1. 群/用户黑名单交集命中（配置了的维度全部命中才指定对象）；
     2. 当前时间在要过滤的时间窗口内；
     3. 消息包含至少一个类型；
     4. 消息包含的任一类型是「关闭」（拦截）→ 整体拦截；
