@@ -62,7 +62,8 @@ from .filter_core import (
 
 # 配置版本：与 _manifest.json 的 version 保持同步。
 # 1.0.0：初始版本。1.0.2：黑名单改为交集过滤（同时配置群+用户时仅过滤该群内该用户）。
-SUPPORTED_CONFIG_VERSION = "1.0.2"
+# 1.0.3：为全部配置项补充用户友好的中文注释与说明（悬停提示）。
+SUPPORTED_CONFIG_VERSION = "1.0.3"
 
 # 默认过滤时间：全天（periods 空） + 每天（weekdays 空）
 DEFAULT_FILTER_PERIODS: List[str] = []
@@ -92,15 +93,23 @@ class BlacklistSectionConfig(PluginConfigBase):
     group_blacklist: list[str] = Field(
         default_factory=list,
         description="群黑名单（填群号；仅黑名单。与用户黑名单同时配置时为交集：仅过滤该群内的黑名单用户；单独配置 = 整群过滤。留空 = 不按群过滤）",
+        json_schema_extra={
+            "label": "群黑名单",
+            "hint": "要过滤的群号，每行一个",
+        },
     )
     user_blacklist: list[str] = Field(
         default_factory=list,
         description="用户黑名单（填用户ID 或 平台:用户ID，如 \"123456789\" 或 \"qq:123456789\"；仅黑名单。与群黑名单同时配置时为交集：仅过滤黑名单群内该用户的消息；单独配置 = 过滤该用户的所有消息（含私聊）。可填 all（大小写不敏感，也支持 \"qq:all\"）表示群黑名单中所配置的群的群内所有成员，需配合群黑名单使用。留空 = 不按用户过滤）",
+        json_schema_extra={
+            "label": "用户黑名单",
+            "hint": "要过滤的用户，每行一个",
+        },
     )
 
 
 class ScheduleSectionConfig(PluginConfigBase):
-    """过滤时间窗口。"""
+    """过滤时间窗口（schedule 配置节）：限定每日时段与每周星期的过滤生效范围。"""
 
     __ui_label__ = "过滤时间"
     __ui_icon__ = "schedule"
@@ -109,10 +118,18 @@ class ScheduleSectionConfig(PluginConfigBase):
     filter_periods: list[str] = Field(
         default_factory=lambda: list(DEFAULT_FILTER_PERIODS),
         description="每日要过滤的时间段（北京时间 HH:MM-HH:MM，支持跨天如 \"22:00-02:00\"；例：\"09:00-12:00\"。留空 = 全天）",
+        json_schema_extra={
+            "label": "每日过滤时间段",
+            "hint": "每日过滤时段，留空全天",
+        },
     )
     filter_weekdays: list[int] = Field(
         default_factory=lambda: list(DEFAULT_FILTER_WEEKDAYS),
         description="每周要过滤的星期（1=周一 ... 7=周日；如 [1,2,3,4,5] 表示仅工作日。留空 = 每天）",
+        json_schema_extra={
+            "label": "每周过滤星期",
+            "hint": "每周过滤星期，留空每天",
+        },
     )
 
 
@@ -126,22 +143,42 @@ class TypeSwitchSectionConfig(PluginConfigBase):
     allow_poke: bool = Field(
         default=DEFAULT_ALLOW_POKE,
         description="戳一戳：开启 = 不拦截；关闭 = 拦截（默认开）",
+        json_schema_extra={
+            "label": "戳一戳",
+            "hint": "戳一戳：开则不拦截",
+        },
     )
     allow_emoji: bool = Field(
         default=DEFAULT_ALLOW_EMOJI,
         description="表情包：开启 = 不拦截；关闭 = 拦截（默认开）",
+        json_schema_extra={
+            "label": "表情包",
+            "hint": "表情包：开则不拦截",
+        },
     )
     allow_forward: bool = Field(
         default=DEFAULT_ALLOW_FORWARD,
         description="合并转发的信息：开启 = 不拦截；关闭 = 拦截（默认关）",
+        json_schema_extra={
+            "label": "合并转发",
+            "hint": "合并转发：开则不拦截",
+        },
     )
     allow_image: bool = Field(
         default=DEFAULT_ALLOW_IMAGE,
         description="包含图片的信息（区别于表情包）：开启 = 不拦截；关闭 = 拦截（默认关）",
+        json_schema_extra={
+            "label": "图片",
+            "hint": "图片：开则不拦截",
+        },
     )
     allow_text: bool = Field(
         default=DEFAULT_ALLOW_TEXT,
         description="文字信息：开启 = 不拦截；关闭 = 拦截（默认开）",
+        json_schema_extra={
+            "label": "文字信息",
+            "hint": "文字：开则不拦截",
+        },
     )
 
 
@@ -152,7 +189,14 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件（关闭后不拦截任何消息）")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件（关闭后不拦截任何消息）",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步，用于检查配置文件是否需要更新）",
@@ -160,16 +204,25 @@ class PluginSectionConfig(PluginConfigBase):
             "disabled": True,
             "hidden": True,
             "label": "配置版本",
+            "hint": "配置版本，勿改",
         },
     )
     # 归档（紧跟 config_version 后）：保存的 json 文件名称（仅支持英文）+ 归档开关
     archive_file_name: str = Field(
         default="",
         description="保存的 json 文件名称（仅支持英文，如 my_rule；可省略 .json。留空 = 使用时间戳命名）",
+        json_schema_extra={
+            "label": "归档文件名",
+            "hint": "归档文件名，留空自动",
+        },
     )
     archive_enabled: bool = Field(
         default=False,
         description="归档开关：开启（设为 true）并保存修改后，自动把当前过滤配置转成 json 放进插件数据文件夹（只归档，不自动重置；恢复默认请在 WebUI 手动清空）。未归档的配置同样生效",
+        json_schema_extra={
+            "label": "归档开关",
+            "hint": "开启则导出配置归档",
+        },
     )
 
 
