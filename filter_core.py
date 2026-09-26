@@ -5,6 +5,8 @@
 - 群 / 用户黑名单（仅黑名单，用于过滤信息）匹配；
 - 入站消息分类（戳一戳 / 表情包 / 合并转发 / 图片 / 文字）；
 - 根据各消息类型开关（开启=不拦截，关闭=拦截）决定消息是否被拦截；
+- 关键词屏蔽：对**纯文本消息**（不含图片/表情包/合并转发）命中配置关键词即拦截，
+  受 ``allow_keyword`` 总开关控制，**不受其它类型开关（如 allow_text）影响**；
 - 过滤配置归档 JSON 的构造与归档文件名校验。
 
 约定：
@@ -14,7 +16,10 @@
 - 黑名单为交集过滤：配置了哪些维度就必须同时命中哪些维度（如同时配置群+用户，
   则只有该群内该用户的消息才被过滤）；某维度留空 = 不限制该维度；
 - 消息分类为并集：消息只要包含任一被关闭（拦截）的类型，即被整体拦截；
-  只有包含的所有类型均为开启（放行）时才入库入站；未识别的消息类型（语音/视频/文件/其它通知等）一律放行。
+  只有包含的所有类型均为开启（放行）时才入库入站；未识别的消息类型（语音/视频/文件/其它通知等）一律放行；
+- 关键词屏蔽只匹配纯文本消息（含文本段、且不含图片/表情包/合并转发段），
+  命中任一关键词即拦截：独立于类型开关（allow_text 关掉只是整体拦截全部文字消息，
+  与关键词列表无关），仅受 allow_keyword 总开关控制。
 """
 
 from __future__ import annotations
@@ -290,6 +295,70 @@ def is_category_allowed(category: str, type_config: Mapping[str, Any]) -> bool:
     return bool(val)
 
 
+# -------------------- 关键词屏蔽（仅纯文本消息） --------------------
+
+# 出现这些段即视为「非纯文本消息」，关键词规则不生效
+_NON_TEXT_SEGMENTS = frozenset({CAT_IMAGE, CAT_EMOJI, CAT_FORWARD})
+
+
+def extract_plain_text(message: Mapping[str, Any]) -> str:
+    """提取**纯文本消息**的文本内容；非纯文本消息返回空字符串。
+
+    - 只匹配纯文本消息：消息含 ``image`` / ``emoji`` / ``forward`` 段（或顶层
+      ``is_picture`` / ``is_emoji`` 标志）时返回空字符串 —— 合并转发与表情包不匹配；
+    - 通知（戳一戳 / 撤回 / 禁言等，``is_notify=true``）不参与关键词匹配；
+    - 多个文本段按出现顺序拼接（段间以换行分隔），便于按整条消息文本匹配关键词。
+    """
+    if not isinstance(message, Mapping):
+        return ""
+    if bool(message.get("is_notify", False)):
+        return ""
+    if bool(message.get("is_emoji", False)) or bool(message.get("is_picture", False)):
+        return ""
+    raw_message = message.get("raw_message")
+    if not isinstance(raw_message, list):
+        return ""
+    parts: List[str] = []
+    for seg in raw_message:
+        if not isinstance(seg, Mapping):
+            continue
+        seg_type = str(seg.get("type") or "").strip()
+        if seg_type in _NON_TEXT_SEGMENTS:
+            return ""
+        if seg_type == "text":
+            text = _segment_text(seg.get("data"))
+            if text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def normalize_keywords(entries: Any) -> List[str]:
+    """规范化关键词列表：跳过空值与纯空白项，去重并保持配置顺序。"""
+    if isinstance(entries, str):
+        entries = [entries]
+    if not isinstance(entries, (list, tuple, set, frozenset)):
+        return []
+    result: List[str] = []
+    for entry in entries:
+        keyword = str(entry or "").strip()
+        if keyword and keyword not in result:
+            result.append(keyword)
+    return result
+
+
+def match_keywords(text: str, keywords: Sequence[str]) -> Optional[str]:
+    """返回**首个命中**的配置关键词；无命中返回 None（子串匹配、大小写敏感）。
+
+    关键词与消息文本均 ``strip()``，避免配置里误带首尾空格导致永远不命中。
+    """
+    if not text or not keywords:
+        return None
+    for keyword in keywords:
+        if keyword and keyword in text:
+            return keyword
+    return None
+
+
 def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any]) -> bool:
     """核心决策：该消息是否应被拦截（不入库、不入站）。
 
@@ -302,13 +371,17 @@ def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any
             "filter_weekdays": [...],    # 1=周一 ... 7=周日
             "types": {"allow_poke": bool, "allow_emoji": bool,
                       "allow_forward": bool, "allow_image": bool, "allow_text": bool},
+            "allow_keyword": bool,       # 关键词屏蔽总开关（默认 True）
+            "keyword_blacklist": [...],  # 关键词屏蔽（仅纯文本消息）
         }
 
     判定流程：
     1. 群/用户黑名单交集命中（配置了的维度全部命中才指定对象）；
     2. 当前时间在要过滤的时间窗口内；
-    3. 消息包含至少一个类型；
-    4. 消息包含的任一类型是「关闭」（拦截）→ 整体拦截；
+    3. 关键词屏蔽（allow_keyword 为真且列表非空）：纯文本消息命中任一关键词
+       → 整体拦截（独立于类型开关，allow_text 为「关」时也只看本步骤的开关）；
+    4. 消息包含至少一个类型；
+    5. 消息包含的任一类型是「关闭」（拦截）→ 整体拦截；
        全部包含类型均「开启」（放行）→ 放行。
     """
     if not isinstance(message, Mapping) or not isinstance(filter_config, Mapping):
@@ -327,6 +400,15 @@ def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any
     )
     if not in_filter_window(periods, weekdays):
         return False
+    # 关键词屏蔽：只匹配纯文本消息（图片/表情包/合并转发不匹配），独立于类型开关
+    # （仅受同节的 allow_keyword 总开关控制，不受 allow_text 等类型开关影响）
+    keywords = (
+        normalize_keywords(filter_config.get("keyword_blacklist"))
+        if bool(filter_config.get("allow_keyword", True))
+        else []
+    )
+    if keywords and match_keywords(extract_plain_text(message), keywords):
+        return True
     cats = classify_message(message)
     if not cats:
         return False
@@ -370,7 +452,7 @@ def build_archive_payload(
 ) -> Dict[str, Any]:
     """把当前过滤配置构造为可归档的 JSON 结构。
 
-    仅包含「过滤规则」（黑名单/时间/类型开关），不含归档控制字段
+    仅包含「过滤规则」（黑名单/时间/类型开关/关键词），不含归档控制字段
     （archive_file_name / archive_enabled）。
     """
     exported_at = exported_at or datetime.now(TZ)
@@ -390,4 +472,7 @@ def build_archive_payload(
             f"allow_{cat}": bool((filter_config.get("types") or {}).get(f"allow_{cat}"))
             for cat in ALL_CATEGORIES
         },
+        # 关键词屏蔽总开关（不在 types.allow_* 里：它不是消息类型开关）
+        "allow_keyword": bool(filter_config.get("allow_keyword", True)),
+        "keywords": normalize_keywords(filter_config.get("keyword_blacklist")),
     }

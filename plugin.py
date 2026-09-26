@@ -7,7 +7,11 @@
 1. 群 / 用户黑名单交集命中（仅黑名单；配置了哪些维度就必须同时命中哪些维度，
    如同时配置群+用户 = 仅过滤该群内该用户的消息；名单为空 = 不限制该维度）；
 2. 当前北京时间（UTC+8）处于配置的「要过滤的时间」窗口（每日时间段 + 每周星期，参考峰谷模型切换插件）；
-3. 消息包含至少一个可分类类型，且包含的任一类型开关为「关闭」（拦截）→ 整体拦截。
+3. 关键词屏蔽：`types.allow_keyword` 开启且 `types.keyword_blacklist` 非空时，
+   纯文本消息文本包含任一配置关键词 → 直接拦截（可配置多个关键词；图片/表情包/
+   合并转发不参与匹配）。本项**独立于其它类型开关**——文字开关「关」只是整体拦截
+   全部文字消息，与关键词列表无关；
+4. 消息包含至少一个可分类类型，且包含的任一类型开关为「关闭」（拦截）→ 整体拦截。
 
 消息类型开关（开启=不拦截，关闭=拦截）：
 - 戳一戳（开）     poke   —— 默认开启（不拦截）
@@ -15,6 +19,7 @@
 - 合并转发的信息   forward—— 默认关闭（拦截）
 - 包含图片的信息   image  —— 默认关闭（拦截，区别于表情包）
 - 文字信息（开）   text   —— 默认开启（不拦截）
+- 关键词屏蔽（开） keyword—— 默认开启（总开关）；关键词列表默认空（不启用）
 
 归档功能（多版过滤规则）：
 - 配置开头（紧跟在 config_version 后）新增 ``archive_file_name``（仅支持英文，默认空）
@@ -52,8 +57,11 @@ from .filter_core import (
     build_archive_payload,
     classify_message,
     extract_ids,
+    extract_plain_text,
     in_filter_window,
     is_targeted,
+    match_keywords,
+    normalize_keywords,
     sanitize_archive_filename,
     should_intercept,
 )
@@ -63,7 +71,8 @@ from .filter_core import (
 # 配置版本：与 _manifest.json 的 version 保持同步。
 # 1.0.0：初始版本。1.0.2：黑名单改为交集过滤（同时配置群+用户时仅过滤该群内该用户）。
 # 1.0.3：为全部配置项补充用户友好的中文注释与说明（悬停提示）。
-SUPPORTED_CONFIG_VERSION = "1.0.3"
+# 1.0.4：新增关键词屏蔽（types.keyword_blacklist，仅纯文本消息）；配置项补充英文翻译（en_US）。
+SUPPORTED_CONFIG_VERSION = "1.0.4"
 
 # 默认过滤时间：全天（periods 空） + 每天（weekdays 空）
 DEFAULT_FILTER_PERIODS: List[str] = []
@@ -75,9 +84,26 @@ DEFAULT_ALLOW_EMOJI = True
 DEFAULT_ALLOW_FORWARD = False
 DEFAULT_ALLOW_IMAGE = False
 DEFAULT_ALLOW_TEXT = True
+DEFAULT_ALLOW_KEYWORD = True
 
 # 归档 JSON 存放子目录（位于 ctx.paths.data_dir 下）
 ARCHIVE_DIR_NAME = "archive"
+
+
+# ==================== 配置 i18n 辅助 ====================
+
+
+def _schema_i18n(*, label_en: str, hint_en: str | None = None) -> dict[str, dict[str, str]]:
+    """构造 WebUI 配置项英文翻译（保留外层中文字段兼容默认 locale zh-CN）。
+
+    与官方 Napcat 适配器及其它 cateye 插件 ``json_schema_extra["i18n"]`` 的
+    key 约定一致：采用下划线 locale 名（``en_US``），每个 locale 下可含
+    ``label`` 与可选 ``hint``。
+    """
+    i18n: dict[str, dict[str, str]] = {"en_US": {"label": label_en}}
+    if hint_en is not None:
+        i18n["en_US"]["hint"] = hint_en
+    return i18n
 
 
 # ==================== 配置模型 ====================
@@ -96,6 +122,10 @@ class BlacklistSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "群黑名单",
             "hint": "要过滤的群号，每行一个",
+            "i18n": _schema_i18n(
+                label_en="Group blacklist",
+                hint_en="Group IDs to filter, one per line.",
+            ),
         },
     )
     user_blacklist: list[str] = Field(
@@ -104,6 +134,10 @@ class BlacklistSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "用户黑名单",
             "hint": "要过滤的用户，每行一个",
+            "i18n": _schema_i18n(
+                label_en="User blacklist",
+                hint_en="Users to filter, one per line.",
+            ),
         },
     )
 
@@ -121,6 +155,10 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "每日过滤时间段",
             "hint": "每日过滤时段，留空全天",
+            "i18n": _schema_i18n(
+                label_en="Daily filter periods",
+                hint_en="Daily filter windows, leave empty for all day.",
+            ),
         },
     )
     filter_weekdays: list[int] = Field(
@@ -129,12 +167,21 @@ class ScheduleSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "每周过滤星期",
             "hint": "每周过滤星期，留空每天",
+            "i18n": _schema_i18n(
+                label_en="Weekly filter weekdays",
+                hint_en="Weekdays to filter, leave empty for every day.",
+            ),
         },
     )
 
 
 class TypeSwitchSectionConfig(PluginConfigBase):
-    """消息类型开关：开启 = 不拦截（放行入库入站）；关闭 = 拦截。"""
+    """消息类型开关：开启 = 不拦截（放行入库入站）；关闭 = 拦截。
+
+    末尾两项为「关键词屏蔽」：``allow_keyword`` 是总开关（开 = 生效，关 = 一律不按
+    关键词拦截），``keyword_blacklist`` 是关键词列表。关键词规则**独立于其它类型
+    开关**：``allow_text`` 关闭只是整体拦截全部文字消息，与关键词列表无关。
+    """
 
     __ui_label__ = "消息类型开关"
     __ui_icon__ = "toggle_on"
@@ -146,6 +193,10 @@ class TypeSwitchSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "戳一戳",
             "hint": "戳一戳：开则不拦截",
+            "i18n": _schema_i18n(
+                label_en="Poke",
+                hint_en="Poke: on = not blocked.",
+            ),
         },
     )
     allow_emoji: bool = Field(
@@ -154,6 +205,10 @@ class TypeSwitchSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "表情包",
             "hint": "表情包：开则不拦截",
+            "i18n": _schema_i18n(
+                label_en="Emoji sticker",
+                hint_en="Emoji sticker: on = not blocked.",
+            ),
         },
     )
     allow_forward: bool = Field(
@@ -162,6 +217,10 @@ class TypeSwitchSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "合并转发",
             "hint": "合并转发：开则不拦截",
+            "i18n": _schema_i18n(
+                label_en="Forwarded message",
+                hint_en="Forwarded (merged) message: on = not blocked.",
+            ),
         },
     )
     allow_image: bool = Field(
@@ -170,6 +229,10 @@ class TypeSwitchSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "图片",
             "hint": "图片：开则不拦截",
+            "i18n": _schema_i18n(
+                label_en="Image",
+                hint_en="Message with images: on = not blocked.",
+            ),
         },
     )
     allow_text: bool = Field(
@@ -178,6 +241,46 @@ class TypeSwitchSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "文字信息",
             "hint": "文字：开则不拦截",
+            "i18n": _schema_i18n(
+                label_en="Text",
+                hint_en="Text message: on = not blocked.",
+            ),
+        },
+    )
+    allow_keyword: bool = Field(
+        default=DEFAULT_ALLOW_KEYWORD,
+        description=(
+            "关键词屏蔽开关：开启 = 关键词屏蔽生效；关闭 = 关键词列表一律不参与拦截（默认开）。"
+            "本开关与其它类型开关互不影响——关键词规则独立生效，不受文字/图片等开关控制"
+        ),
+        json_schema_extra={
+            "label": "关键词屏蔽",
+            "hint": "关键词屏蔽总开关（关则不按关键词拦截）",
+            "x-widget": "switch",
+            "i18n": _schema_i18n(
+                label_en="Keyword blocking",
+                hint_en="Master switch for keyword blocking (off = keywords never block).",
+            ),
+        },
+    )
+    keyword_blacklist: list[str] = Field(
+        default_factory=list,
+        description=(
+            "关键词屏蔽：仅对纯文本消息生效（不含图片/表情包/合并转发的消息不参与匹配），"
+            "消息文本包含其中任一关键词即拦截整条消息，可填多个关键词；"
+            "生效对象沿用群/用户黑名单（命中黑名单的群或用户），并同样受过滤时间窗口限制；"
+            "本项独立于上方类型开关——文字开关为「开」时，命中关键词的纯文本消息依然会被拦截，"
+            "文字开关为「关」时也只是整体拦截全部文字消息，与关键词列表无关；"
+            "受上方「关键词屏蔽」开关控制，只有该开关为「开」时本列表才生效。"
+            "留空 = 不按关键词屏蔽"
+        ),
+        json_schema_extra={
+            "label": "关键词屏蔽列表",
+            "hint": "命中即拦截的纯文本关键词，每行一个",
+            "i18n": _schema_i18n(
+                label_en="Keyword blocklist",
+                hint_en="Plain-text keywords, one per line; a hit blocks the message.",
+            ),
         },
     )
 
@@ -195,6 +298,10 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "启用插件",
             "hint": "插件总开关",
+            "i18n": _schema_i18n(
+                label_en="Enabled",
+                hint_en="Master switch of the plugin.",
+            ),
         },
     )
     config_version: str = Field(
@@ -205,6 +312,10 @@ class PluginSectionConfig(PluginConfigBase):
             "hidden": True,
             "label": "配置版本",
             "hint": "配置版本，勿改",
+            "i18n": _schema_i18n(
+                label_en="Config version",
+                hint_en="Config schema version; do not change.",
+            ),
         },
     )
     # 归档（紧跟 config_version 后）：保存的 json 文件名称（仅支持英文）+ 归档开关
@@ -214,6 +325,10 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "归档文件名",
             "hint": "归档文件名，留空自动",
+            "i18n": _schema_i18n(
+                label_en="Archive file name",
+                hint_en="Archive file name; leave empty to use a timestamp.",
+            ),
         },
     )
     archive_enabled: bool = Field(
@@ -222,6 +337,10 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "归档开关",
             "hint": "开启则导出配置归档",
+            "i18n": _schema_i18n(
+                label_en="Archive enabled",
+                hint_en="When on (and saved), export the current filter config as JSON.",
+            ),
         },
     )
 
@@ -255,6 +374,8 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             "filter_periods": list(self.config.schedule.filter_periods or []),
             "filter_weekdays": list(self.config.schedule.filter_weekdays or []),
             "types": types,
+            "allow_keyword": bool(self.config.types.allow_keyword),
+            "keyword_blacklist": list(self.config.types.keyword_blacklist or []),
         }
 
     def _get_archive_dir(self) -> str:
@@ -349,6 +470,15 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             }.get(cat, cat)
             state = "开（放行）" if cfg["types"].get(f"allow_{cat}") else "关（拦截）"
             lines.append(f"  {label}：{state}")
+        keyword_on = "开（生效）" if cfg.get("allow_keyword") else "关（不生效）"
+        lines.append(f"  关键词屏蔽：{keyword_on}")
+        keywords = normalize_keywords(cfg.get("keyword_blacklist"))
+        if keywords:
+            lines.append(
+                f"关键词列表（仅纯文本，独立于类型开关）：{'、'.join(keywords)}"
+            )
+        else:
+            lines.append("关键词列表（仅纯文本）：（空，不按关键词屏蔽）")
         return lines
 
     # ==================== Hook：消息过滤 ====================
@@ -356,13 +486,17 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.before_process",
         name="custom_filter_blocker",
-        description="按黑名单+时间窗口+类型开关拦截指定群/用户的消息（不入库、不入站）",
+        description="按黑名单+时间窗口+类型开关+关键词拦截指定群/用户的消息（不入库、不入站）",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
     )
     async def hook_custom_filter(self, **kwargs: Any) -> Dict[str, Any]:
-        """拦截入站消息：命中黑名单 + 时间窗口 + 关闭类型 → abort（消息不入库、不入站）。"""
+        """拦截入站消息：命中黑名单 + 时间窗口 +（关键词 或 关闭类型）→ abort（不入库、不入站）。
+
+        关键词一行仅在 ``types.allow_keyword`` 开启（且列表非空）时才可能命中；
+        该规则与其它类型开关互不影响。
+        """
         try:
             if not self.config.plugin.enabled:
                 return {"action": "continue"}
@@ -373,12 +507,26 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             if should_intercept(message, filter_config):
                 group_id, user_id = _extract_ids(message)
                 cats = classify_message(message)
-                self.ctx.logger.info(
-                    "已拦截消息（群=%s 用户=%s 类型=%s）",
-                    group_id or "-",
-                    user_id or "-",
-                    ",".join(sorted(cats)) or "-",
+                keywords = (
+                    normalize_keywords(filter_config.get("keyword_blacklist"))
+                    if filter_config.get("allow_keyword")
+                    else []
                 )
+                hit_keyword = match_keywords(extract_plain_text(message), keywords)
+                if hit_keyword:
+                    self.ctx.logger.info(
+                        "已拦截消息（群=%s 用户=%s 关键词=%s）",
+                        group_id or "-",
+                        user_id or "-",
+                        hit_keyword,
+                    )
+                else:
+                    self.ctx.logger.info(
+                        "已拦截消息（群=%s 用户=%s 类型=%s）",
+                        group_id or "-",
+                        user_id or "-",
+                        ",".join(sorted(cats)) or "-",
+                    )
                 return {"action": "abort"}
         except Exception as e:
             self.ctx.logger.warning("消息过滤判定异常（放行本条）：%s", e)
