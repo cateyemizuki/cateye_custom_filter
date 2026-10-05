@@ -28,6 +28,7 @@
   放进插件数据文件夹（data/plugins/github.cateye.custom-filter/archive/）：
   - 填写了有效的 archive_file_name → 用该名称归档；
   - 未填或填入内容无效 → 用时间戳兜底命名（filter_YYYYmmdd_HHMMSS.json）；
+  - 配置内容与上次归档一致时跳过（内容哈希去重）；同名文件追加序号后缀，不覆盖。
 - 插件只负责归档，**不写回/不重置 config.toml**（config.toml 由 Runner 生成与维护，
   插件不自行落盘，避免与 WebUI 保存、热重载竞争）；需要恢复默认时请在 WebUI 手动清空；
 - 即使已经配置好的文件没有使用开关进行归档（即还可以在 WebUI 中修改），也生效。
@@ -35,10 +36,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime
-from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from maibot_sdk import (
     CONFIG_RELOAD_SCOPE_SELF,
@@ -50,6 +52,7 @@ from maibot_sdk import (
 )
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
+from .admin_util import collect_admins, plain_id  # 管理员判定统一模块（来源：cateye_common）
 from .filter_core import (
     ALL_CATEGORIES,
     TZ,
@@ -72,7 +75,12 @@ from .filter_core import (
 # 1.0.0：初始版本。1.0.2：黑名单改为交集过滤（同时配置群+用户时仅过滤该群内该用户）。
 # 1.0.3：为全部配置项补充用户友好的中文注释与说明（悬停提示）。
 # 1.0.4：新增关键词屏蔽（types.keyword_blacklist，仅纯文本消息）；配置项补充英文翻译（en_US）。
-SUPPORTED_CONFIG_VERSION = "1.0.4"
+# 1.0.5：兼容性声明修正——配置分组补 __ui_i18n__ 英文翻译、字段 i18n 补规范 en 键、
+#        manifest supported_locales 补 en、sdk.min_version 修正为 2.8.0；过滤逻辑不变。
+# 1.0.6：黑名单混填 all+具体用户改并集语义；归档内容哈希去重、同名不覆盖；跨天时段
+#        以开始时间归属当日；/过滤状态 限管理员（plugin.admins）；Hook 显式 timeout_ms
+#        并缓存时段解析；manifest plugin_type 改 extension。
+SUPPORTED_CONFIG_VERSION = "1.0.6"
 
 # 默认过滤时间：全天（periods 空） + 每天（weekdays 空）
 DEFAULT_FILTER_PERIODS: List[str] = []
@@ -96,14 +104,23 @@ ARCHIVE_DIR_NAME = "archive"
 def _schema_i18n(*, label_en: str, hint_en: str | None = None) -> dict[str, dict[str, str]]:
     """构造 WebUI 配置项英文翻译（保留外层中文字段兼容默认 locale zh-CN）。
 
-    与官方 Napcat 适配器及其它 cateye 插件 ``json_schema_extra["i18n"]`` 的
-    key 约定一致：采用下划线 locale 名（``en_US``），每个 locale 下可含
-    ``label`` 与可选 ``hint``。
+    同时提供两种 locale 键名：``en``（1.3.0 开发文档 §5.1 的规范写法，
+    ``i18n[locale]`` 按界面语言命中）与 ``en_US``（部分旧版 WebUI / 官方
+    适配器使用的下划线命名），保证任一命名约定下英文翻译都能生效。
+    每个 locale 下含 ``label`` 与可选 ``hint``。
     """
-    i18n: dict[str, dict[str, str]] = {"en_US": {"label": label_en}}
+    entry: dict[str, str] = {"label": label_en}
     if hint_en is not None:
-        i18n["en_US"]["hint"] = hint_en
-    return i18n
+        entry["hint"] = hint_en
+    return {"en": dict(entry), "en_US": dict(entry)}
+
+
+# 分组级英文翻译（__ui_i18n__，规范见开发文档 §5.1：分组必须带 __ui_label__ + __ui_i18n__）
+def _ui_i18n(*, title_en: str, description_en: str) -> dict[str, dict[str, str]]:
+    entry: dict[str, dict[str, str]] = {
+        "en": {"title": title_en, "description": description_en}
+    }
+    return entry
 
 
 # ==================== 配置模型 ====================
@@ -115,6 +132,10 @@ class BlacklistSectionConfig(PluginConfigBase):
     __ui_label__ = "群/用户黑名单"
     __ui_icon__ = "block"
     __ui_order__ = 1
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = _ui_i18n(
+        title_en="Group / User Blacklist",
+        description_en="Blacklist filtering by group and/or user IDs.",
+    )
 
     group_blacklist: list[str] = Field(
         default_factory=list,
@@ -130,7 +151,7 @@ class BlacklistSectionConfig(PluginConfigBase):
     )
     user_blacklist: list[str] = Field(
         default_factory=list,
-        description="用户黑名单（填用户ID 或 平台:用户ID，如 \"123456789\" 或 \"qq:123456789\"；仅黑名单。与群黑名单同时配置时为交集：仅过滤黑名单群内该用户的消息；单独配置 = 过滤该用户的所有消息（含私聊）。可填 all（大小写不敏感，也支持 \"qq:all\"）表示群黑名单中所配置的群的群内所有成员，需配合群黑名单使用。留空 = 不按用户过滤）",
+        description="用户黑名单（填用户ID 或 平台:用户ID，如 \"123456789\" 或 \"qq:123456789\"；仅黑名单。与群黑名单同时配置时为交集：仅过滤黑名单群内该用户的消息；单独配置 = 过滤该用户的所有消息（含私聊）。可填 all（大小写不敏感，也支持 \"qq:all\"）表示群黑名单中所配置的群的群内所有成员，需配合群黑名单使用。可与具体用户 ID 混填：混填时取并集——all 命中（群维度）或具体用户命中（该用户所有消息）任一即拦截。留空 = 不按用户过滤）",
         json_schema_extra={
             "label": "用户黑名单",
             "hint": "要过滤的用户，每行一个",
@@ -148,10 +169,14 @@ class ScheduleSectionConfig(PluginConfigBase):
     __ui_label__ = "过滤时间"
     __ui_icon__ = "schedule"
     __ui_order__ = 2
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = _ui_i18n(
+        title_en="Filter Schedule",
+        description_en="Limit filtering to daily time windows and weekdays.",
+    )
 
     filter_periods: list[str] = Field(
         default_factory=lambda: list(DEFAULT_FILTER_PERIODS),
-        description="每日要过滤的时间段（北京时间 HH:MM-HH:MM，支持跨天如 \"22:00-02:00\"；例：\"09:00-12:00\"。留空 = 全天）",
+        description="每日要过滤的时间段（北京时间 HH:MM-HH:MM，支持跨天如 \"22:00-02:00\"；跨天时段以开始时间归属当日，如「周一 22:00-02:00」覆盖周一 22:00 至周二 02:00；例：\"09:00-12:00\"。留空 = 全天）",
         json_schema_extra={
             "label": "每日过滤时间段",
             "hint": "每日过滤时段，留空全天",
@@ -186,6 +211,10 @@ class TypeSwitchSectionConfig(PluginConfigBase):
     __ui_label__ = "消息类型开关"
     __ui_icon__ = "toggle_on"
     __ui_order__ = 3
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = _ui_i18n(
+        title_en="Message Type Switches",
+        description_en="Per-type blocking switches and keyword blocking.",
+    )
 
     allow_poke: bool = Field(
         default=DEFAULT_ALLOW_POKE,
@@ -291,6 +320,10 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = _ui_i18n(
+        title_en="Plugin",
+        description_en="Master switch and config archive options.",
+    )
 
     enabled: bool = Field(
         default=True,
@@ -301,6 +334,27 @@ class PluginSectionConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Enabled",
                 hint_en="Master switch of the plugin.",
+            ),
+        },
+    )
+    admins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "管理员列表：仅这些用户可以使用 /过滤状态 命令查看过滤规则明细"
+            "（含黑名单 ID、关键词等）。一行一个用户 ID（也可填 \"qq:123456\" 形式，"
+            "比较时只取 ID 部分）。留空 = 仅本地操作员（bot 控制台）可使用"
+        ),
+        json_schema_extra={
+            "label": "管理员列表",
+            "hint": "可执行 /过滤状态 的管理员用户 ID",
+            "i18n": _schema_i18n(
+                label_en="Administrators",
+                hint_en=(
+                    "Admin list: only these users may run the /filter-status command "
+                    "(which shows blacklist IDs and keywords). One user ID per line "
+                    "(also accepts \"qq:123456\" form; only the ID part is compared). "
+                    "Leave empty = only the local operator (bot console) may run."
+                ),
             ),
         },
     )
@@ -333,7 +387,7 @@ class PluginSectionConfig(PluginConfigBase):
     )
     archive_enabled: bool = Field(
         default=False,
-        description="归档开关：开启（设为 true）并保存修改后，自动把当前过滤配置转成 json 放进插件数据文件夹（只归档，不自动重置；恢复默认请在 WebUI 手动清空）。未归档的配置同样生效",
+        description="归档开关：开启（设为 true）并保存修改后，自动把当前过滤配置转成 json 放进插件数据文件夹（只归档，不自动重置；内容未变化自动跳过，同名文件追加序号后缀不覆盖；恢复默认请在 WebUI 手动清空）。未归档的配置同样生效",
         json_schema_extra={
             "label": "归档开关",
             "hint": "开启则导出配置归档",
@@ -360,6 +414,13 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
 
     config_model: ClassVar[type[PluginConfigBase] | None] = CateyeCustomFilterConfig
     config_reload_subscriptions: ClassVar[Iterable[str]] = ()
+
+    # 时段解析缓存：(原始配置元组键, periods, weekdays)。键取自当前配置，
+    # 配置更新后键变化即自动失效（on_config_update 中亦显式置空）。
+    _schedule_cache: Optional[Tuple[tuple, list, set]] = None
+    # 上次归档内容的哈希（十六进制摘要）：用于内容哈希去重，避免持久开启的
+    # 归档开关在每次保存配置时重复写盘。
+    _last_archive_hash: Optional[str] = None
 
     # ==================== 配置读取 ====================
 
@@ -388,13 +449,62 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
         base = os.path.basename(filename)
         return os.path.join(archive_dir, base)
 
+    def _get_cached_schedule(self) -> Tuple[list, set]:
+        """取（预解析并缓存的）过滤时间窗口 (periods, weekdays)。
+
+        缓存键为时段/星期的原始配置元组：配置更新后键变化即自动失效，
+        Hook 内不再对每条消息重复解析时段字符串。
+        """
+        periods_raw = tuple(self.config.schedule.filter_periods or ())
+        weekdays_raw = tuple(self.config.schedule.filter_weekdays or ())
+        key = (periods_raw, weekdays_raw)
+        cached = self._schedule_cache
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        periods, weekdays, _bad = build_schedule(list(periods_raw), list(weekdays_raw))
+        self._schedule_cache = (key, periods, weekdays)
+        return periods, weekdays
+
+    async def _get_admin_ids(self) -> List[str]:
+        """管理员名单 = 宿主管理员 ∪ 插件配置管理员，按纯 ID 去重（admin_util 语义）。
+
+        - 宿主侧：``ctx.config.get("plugin.permission", ...)``（宿主插件权限名单）；
+          读取失败降级为仅插件配置（debug 日志，不抛异常）；
+        - 插件侧：``plugin.admins`` 配置；
+        - 两路条目均经 ``plain_id`` 归一（兼容 ``qq:123456`` 前缀与裸号）后按纯 ID 去重。
+        """
+        config_admins = list(self.config.plugin.admins or ())
+        try:
+            host_permissions = await self.ctx.config.get("plugin.permission", None)
+        except Exception as e:
+            self.ctx.logger.debug(
+                "读取宿主管理员名单（plugin.permission）失败，降级为仅插件配置管理员：%s", e
+            )
+            return collect_admins(None, config_admins)
+        return collect_admins(host_permissions, config_admins)
+
+    async def _is_admin(self, user_id: Any, is_local_operator: bool = False) -> bool:
+        """命令鉴权：本地操作员（bot 控制台）放行；否则要求发送者在管理员名单内。
+
+        管理员 = 宿主管理员 ∪ 插件配置管理员（见 ``_get_admin_ids``）；
+        发送者 ID 与名单均归一为纯数字 ID 后比较（``qq:123456`` 与 ``123456`` 等价）。
+        """
+        if is_local_operator:
+            return True
+        uid = plain_id(user_id)
+        if not uid:
+            return False
+        return uid in await self._get_admin_ids()
+
     # ==================== 归档 ====================
 
     def _archive_current_config(self, requested_name: str = "") -> Optional[str]:
         """把当前过滤配置归档为 JSON 到插件数据文件夹。
 
         - requested_name 有效 → 使用该名称；否则用时间戳兜底命名；
-        - 返回写入的文件路径；失败返回 None。
+        - 同名文件已存在 → 追加序号后缀（``my_rule.json`` → ``my_rule_2.json``），不覆盖；
+        - 内容与上次归档完全一致（哈希去重）→ 跳过写盘；
+        - 返回写入的文件路径；内容未变化跳过时返回空字符串；失败返回 None。
         """
         try:
             archive_dir = self._get_archive_dir()
@@ -407,12 +517,31 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
                 self._build_filter_config(),
                 config_version=SUPPORTED_CONFIG_VERSION,
             )
+            # 内容哈希去重：归档开关持久开启时，配置内容未变化则跳过重复归档
+            # （meta.exported_at 为时间戳，不参与哈希）
+            content = {k: v for k, v in payload.items() if k != "meta"}
+            content_json = json.dumps(content, ensure_ascii=False, sort_keys=True)
+            content_hash = hashlib.sha256(content_json.encode("utf-8")).hexdigest()
+            if content_hash == self._last_archive_hash:
+                self.ctx.logger.info("过滤配置内容未变化，跳过重复归档")
+                return ""
             path = self._get_archive_path(filename)
             if not path.startswith(archive_dir + os.sep):
                 self.ctx.logger.error("归档路径越出数据目录，已拒绝：%s", path)
                 return None
+            # 同名文件不覆盖：追加序号后缀（my_rule.json → my_rule_2.json、my_rule_3.json…）
+            if os.path.exists(path):
+                stem, ext = os.path.splitext(filename)
+                n = 2
+                while True:
+                    candidate = self._get_archive_path(f"{stem}_{n}{ext}")
+                    if not os.path.exists(candidate):
+                        path = candidate
+                        break
+                    n += 1
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._last_archive_hash = content_hash
             self.ctx.logger.info("过滤配置已归档：%s", path)
             return path
         except Exception as e:
@@ -427,8 +556,29 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
         pattern=r"^/?过滤状态\s*$",
     )
     async def cmd_filter_status(self, **kwargs: Any) -> tuple[bool, str, int]:
-        """输出当前生效的过滤规则摘要（纯文本回复，不声明额外能力）。"""
+        """输出当前生效的过滤规则摘要（纯文本回复，不声明额外能力）。
+
+        仅限管理员（宿主管理员 ∪ 配置 ``plugin.admins`` 名单，按纯 ID 去重）或
+        本地操作员（bot 控制台）使用：回显含黑名单 ID 与关键词明细，不应对群成员公开。
+        """
         stream_id = str(kwargs.get("stream_id") or "")
+        user_id = kwargs.get("user_id")
+        is_local_operator = bool(kwargs.get("is_local_operator"))
+        if not await self._is_admin(user_id, is_local_operator):
+            self.ctx.logger.info(
+                "拒绝非管理员执行过滤状态命令（user_id=%s local_operator=%s）",
+                user_id or "-",
+                is_local_operator,
+            )
+            try:
+                await self.ctx.send.text(
+                    "权限不足：/过滤状态 命令仅管理员可用。"
+                    "请在插件配置的「管理员列表」中添加你的用户 ID。",
+                    stream_id,
+                )
+            except Exception as e:
+                self.ctx.logger.warning("发送权限不足提示失败：%s", e)
+            return False, "权限不足", 1
         lines = self._describe_config()
         try:
             await self.ctx.send.text("\n".join(lines), stream_id)
@@ -490,6 +640,9 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
+        # 显式声明宽松而有限的超时：本过滤器为纯内存判定（无 IO、无网络），
+        # 不应长占入站链路，也避免宿主默认超时变化带来的意外
+        timeout_ms=3000,
     )
     async def hook_custom_filter(self, **kwargs: Any) -> Dict[str, Any]:
         """拦截入站消息：命中黑名单 + 时间窗口 +（关键词 或 关闭类型）→ abort（不入库、不入站）。
@@ -504,7 +657,9 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             if not isinstance(message, Mapping):
                 return {"action": "continue"}
             filter_config = self._build_filter_config()
-            if should_intercept(message, filter_config):
+            # 时间窗口使用预解析缓存（配置更新自动失效），避免逐条消息重复解析时段
+            periods, weekdays = self._get_cached_schedule()
+            if should_intercept(message, filter_config, schedule=(periods, weekdays)):
                 group_id, user_id = _extract_ids(message)
                 cats = classify_message(message)
                 keywords = (
@@ -569,7 +724,10 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
             return
         self._check_config_version()
         self._validate_schedule_config()
-        # 归档开关：开启（true）并保存修改 → 归档当前配置（只归档，不自动重置）
+        # 时段解析缓存随配置更新失效（下次使用时按新配置重建）
+        self._schedule_cache = None
+        # 归档开关：开启（true）并保存修改 → 归档当前配置（只归档，不自动重置）；
+        # 内容未变化时哈希去重跳过；同名文件追加序号后缀，不覆盖
         try:
             archive_enabled = bool(self.config.plugin.archive_enabled)
         except Exception:
@@ -585,6 +743,8 @@ class CateyeCustomFilterPlugin(MaiBotPlugin):
                     f"过滤配置已归档：{path}\n"
                     "如需恢复默认过滤规则，请在 WebUI 手动清空黑名单、恢复默认时间窗口与类型开关。"
                 )
+            elif path == "":
+                msg = "过滤配置内容未变化，跳过重复归档。"
             else:
                 msg = "归档失败（见日志）。"
             self.ctx.logger.info("归档流程：%s", msg)

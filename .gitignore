@@ -14,3 +14,29 @@ test/
 tests/
 test_*.py
 *_test.py
+
+# 发布流程文件（UPLOAD_AGENT 手册与市场登记稿，不入仓库）
+UPLOAD_AGENT.md
+ISSUE_SUBMISSION.md
+
+# ---- 追加自 MaiBot插件开发文档v1.3.0/.gitignore 模板（sync 2026-10-05）----
+/config_back/
+*.log
+.maibot-release.json
+.update_backups/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+smoke_test*.py
+/tests/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp

@@ -10,11 +10,15 @@
 - 过滤配置归档 JSON 的构造与归档文件名校验。
 
 约定：
-- 时段格式 "HH:MM-HH:MM"，支持跨天（如 "22:00-02:00"），开始时间 ≤ 结束时间视为同一自然日；
+- 时段格式 "HH:MM-HH:MM"，支持跨天（如 "22:00-02:00"）：开始时间 < 结束时间视为同一
+  自然日区间，否则视为跨天区间，**以时段开始时间归属当日**（如「周一 22:00-02:00」
+  覆盖周一 22:00 至周二 02:00，凌晨部分按前一天即周一的星期判定）；
 - 星期：1=周一 ... 7=周日；filter_weekdays 为空 = 每天；
 - filter_periods 为空 = 全天；
-- 黑名单为交集过滤：配置了哪些维度就必须同时命中哪些维度（如同时配置群+用户，
+- 黑名单为交集过滤：配置了哪些维度就必须同时命中哪些维度（如同时配置群+具体用户，
   则只有该群内该用户的消息才被过滤）；某维度留空 = 不限制该维度；
+  用户黑名单混填 ``all`` 与具体用户 ID 时取**并集**：``all``（需群维度命中）或
+  具体用户 ID 命中，任一即视为用户维度命中（具体用户不会被 ``all`` 静默忽略）；
 - 消息分类为并集：消息只要包含任一被关闭（拦截）的类型，即被整体拦截；
   只有包含的所有类型均为开启（放行）时才入库入站；未识别的消息类型（语音/视频/文件/其它通知等）一律放行；
 - 关键词屏蔽只匹配纯文本消息（含文本段、且不含图片/表情包/合并转发段），
@@ -123,15 +127,31 @@ def in_filter_window(
     """是否处于「要过滤的时间」。
 
     - weekdays 为空 = 每天；非空 = 仅在这些星期（1=周一 ... 7=周日）；
-    - periods 为空 = 全天；非空 = 仅在这些每日时间段内（含跨天）。
+    - periods 为空 = 全天；非空 = 仅在这些每日时间段内（含跨天）；
+    - **跨天时段以时段开始时间归属当日**：如「周一 22:00-02:00」的窗口覆盖
+      周一 22:00 至周二 02:00——当天 22:00 起的前半夜按当天星期判定，
+      凌晨 00:00 至结束时刻的部分按**前一天**的星期判定（归属前一天开始的窗口）。
     """
     now = dt or datetime.now(TZ)
-    if weekdays and now.isoweekday() not in weekdays:
-        return False
     if not periods:
-        return True
+        return not weekdays or now.isoweekday() in weekdays
     t = now.time()
-    return any(p.contains(t) for p in periods)
+    for p in periods:
+        if p.start < p.end:
+            # 自然日区间：归属当日
+            if p.start <= t < p.end and (not weekdays or now.isoweekday() in weekdays):
+                return True
+        else:
+            # 跨天区间（如 22:00-02:00）：以时段开始时间归属当日。
+            # 当天 start 起的前半夜按当天星期判定；凌晨 00:00 至 end 的部分
+            # 属于「前一天开始的窗口」，按前一天的星期判定。
+            if t >= p.start and (not weekdays or now.isoweekday() in weekdays):
+                return True
+            if t < p.end and (
+                not weekdays or (now - timedelta(days=1)).isoweekday() in weekdays
+            ):
+                return True
+    return False
 
 
 # -------------------- 消息身份提取 --------------------
@@ -185,7 +205,7 @@ def is_targeted(
     group_blacklist: Sequence[Any],
     user_blacklist: Sequence[Any],
 ) -> bool:
-    """是否命中黑名单（仅黑名单，交集语义）。
+    """是否命中黑名单（仅黑名单）。
 
     交集过滤：配置了哪些维度，就必须同时命中哪些维度，全部满足才视为过滤对象：
 
@@ -193,27 +213,32 @@ def is_targeted(
     - 仅配置用户黑名单：消息用户 ID 命中即过滤（含私聊；``all`` 标记在无群
       黑名单时不生效）；
     - 同时配置群 + 用户黑名单：消息必须**既**来自黑名单群、**又**来自黑名单
-      用户（交集）才过滤；用户黑名单中的特殊值 ``all``（大小写不敏感，也支持
-      ``平台:all``）表示该黑名单群内的所有成员（此时等价于整群过滤）；
+      用户（交集）才过滤；
+    - 用户黑名单混填 ``all``（大小写不敏感，也支持 ``平台:all``）与具体用户 ID
+      时取**并集语义**：``all`` 命中（群黑名单中所配置的群 → 群内所有成员，
+      需群维度命中）**或** 具体用户 ID 命中（该用户的所有消息，含私聊与非
+      黑名单群），任一即视为用户维度命中——具体用户 ID 不再被 ``all`` 静默
+      忽略（修复混填漏拦）；
     - 两者均为空：不过滤任何消息。
     """
     group_hit: Optional[bool] = None
     if group_blacklist:
         group_hit = bool(group_id) and any(id_matches(group_id, g) for g in group_blacklist)
-    user_hit: Optional[bool] = None
-    if user_blacklist:
-        entries = [u for u in user_blacklist]
-        # 特殊值 all：群黑名单中所配置的群 → 群内所有成员（需群维度命中）
-        if any(is_all_marker(u) for u in entries):
-            user_hit = bool(group_hit) if group_hit is not None else False
-        else:
-            user_hit = bool(user_id) and any(
-                id_matches(user_id, u) for u in entries if not is_all_marker(u)
-            )
-    if group_hit is None and user_hit is None:
-        return False
-    # 交集：所有已配置维度都必须命中
-    return (group_hit is not False) and (user_hit is not False)
+    if not user_blacklist:
+        # 未配置用户维度：仅按群维度判定（群黑名单为空 = 不过滤任何消息）
+        return group_hit is True
+    entries = list(user_blacklist)
+    # 具体用户 ID 命中（跳过 all 标记）
+    id_hit = bool(user_id) and any(
+        id_matches(user_id, u) for u in entries if not is_all_marker(u)
+    )
+    if any(is_all_marker(u) for u in entries):
+        # 含 all 标记：并集语义 —— all（需群维度命中）或具体用户 ID 命中，任一即拦截
+        return (group_hit is True) or id_hit
+    # 纯具体用户：交集语义（配置了群维度则须同时命中）
+    if group_hit is None:
+        return id_hit
+    return group_hit and id_hit
 
 
 # -------------------- 消息分类 --------------------
@@ -359,7 +384,12 @@ def match_keywords(text: str, keywords: Sequence[str]) -> Optional[str]:
     return None
 
 
-def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any]) -> bool:
+def should_intercept(
+    message: Mapping[str, Any],
+    filter_config: Mapping[str, Any],
+    *,
+    schedule: Optional[Tuple[Sequence[Period], Set[int]]] = None,
+) -> bool:
     """核心决策：该消息是否应被拦截（不入库、不入站）。
 
     filter_config 结构（与插件配置模型对应）::
@@ -375,8 +405,13 @@ def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any
             "keyword_blacklist": [...],  # 关键词屏蔽（仅纯文本消息）
         }
 
+    schedule：可选的预解析时间窗口 ``(periods, weekdays)``（调用方缓存
+    ``build_schedule`` 结果时传入，避免逐条消息重复解析时段配置）；
+    缺省时由 filter_config 现场解析。
+
     判定流程：
-    1. 群/用户黑名单交集命中（配置了的维度全部命中才指定对象）；
+    1. 群/用户黑名单命中（交集语义；用户黑名单混填 all 与具体 ID 时取并集，
+       见 is_targeted）；
     2. 当前时间在要过滤的时间窗口内；
     3. 关键词屏蔽（allow_keyword 为真且列表非空）：纯文本消息命中任一关键词
        → 整体拦截（独立于类型开关，allow_text 为「关」时也只看本步骤的开关）；
@@ -394,10 +429,13 @@ def should_intercept(message: Mapping[str, Any], filter_config: Mapping[str, Any
         filter_config.get("user_blacklist") or (),
     ):
         return False
-    periods, weekdays, _ = build_schedule(
-        filter_config.get("filter_periods") or (),
-        filter_config.get("filter_weekdays") or (),
-    )
+    if schedule is None:
+        periods, weekdays, _ = build_schedule(
+            filter_config.get("filter_periods") or (),
+            filter_config.get("filter_weekdays") or (),
+        )
+    else:
+        periods, weekdays = schedule
     if not in_filter_window(periods, weekdays):
         return False
     # 关键词屏蔽：只匹配纯文本消息（图片/表情包/合并转发不匹配），独立于类型开关
